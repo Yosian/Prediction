@@ -1,0 +1,67 @@
+import os
+import json
+import math
+
+from datetime import date
+
+import pandas as pd
+import configparser
+import matplotlib.pyplot as plt
+
+from matplotlib.pyplot import figure
+
+def get_parameters():
+    config_file = os.path.join(os.path.dirname('__file__'), 'config.ini')
+    config_parser = configparser.ConfigParser()
+    config_parser.read(config_file)
+    days_worth_of_data = int(config_parser['predictionsystem']['days_worth_of_data'])
+    time_plot_window = int(config_parser['predictionsystem']['time_plot_window'])
+    clients = [client.strip() for client in config_parser['predictionsystem']['clients'].split(',')]
+    days_to_predict = int(config_parser['predictionsystem']['days_to_predict'])
+    past_days_to_predict = int(config_parser['predictionsystem']['past_days_to_predict'])
+    return days_worth_of_data, clients, days_to_predict, time_plot_window, past_days_to_predict
+    
+def get_years():
+        years_worth_of_data = math.ceil(days_worth_of_data/365)
+        years = range(date.today().year - years_worth_of_data, date.today().year + 2)
+        return years
+
+def get_client_data():
+    with open('data_and_predictions.json') as file:  
+        client_data = json.load(file)
+    return client_data
+        
+def visualise_prediction():
+    for client in clients:
+        timeline = pd.DataFrame(client_data[client]['prediction'])[-time_plot_window:]['date']
+        timeline = pd.Series([pd.to_datetime(date) for date in timeline])
+        upper = pd.DataFrame(client_data[client]['prediction'])[-time_plot_window:]['upper']
+        lower = pd.DataFrame(client_data[client]['prediction'])[-time_plot_window:]['lower']
+        expected = pd.DataFrame(client_data[client]['prediction'])[-time_plot_window:]['expected']
+        queries = pd.DataFrame(client_data[client]['data'])[-time_plot_window + days_to_predict:]['queries']
+
+        figure(num=None, figsize=(16, 6), dpi=80, facecolor='w', edgecolor='k')
+        plt.title(client + ' ' + str(time_plot_window) + ' day visualisation with ' +
+                  str(days_to_predict) + ' prediction days and real queries')
+        plt.plot(timeline, upper, 'g')
+        plt.plot(timeline, lower, 'g')
+        plt.plot(timeline, expected, 'b', label='predicted values')
+        
+        queries_over_model_timeline = timeline[: time_plot_window - (past_days_to_predict + days_to_predict)]
+        queries_over_model = queries[:time_plot_window - (past_days_to_predict + days_to_predict)]
+        plt.plot(queries_over_model_timeline, queries_over_model, 'bo', label='queries over model')
+        if past_days_to_predict != 0:
+            prediction_query_timeline = timeline[time_plot_window - (past_days_to_predict + days_to_predict) : time_plot_window - days_to_predict]
+            prediction_query = queries[time_plot_window - (past_days_to_predict + days_to_predict):]
+            plt.plot(prediction_query_timeline, prediction_query, 'ro', label='queries over prediction')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
+
+if __name__ == '__main__':
+    
+    client_data = get_client_data()
+    
+    days_worth_of_data, clients, days_to_predict, time_plot_window, past_days_to_predict = get_parameters()
+    
+    years = get_years()
+
+    visualise_prediction()
