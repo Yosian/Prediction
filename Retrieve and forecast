@@ -1,0 +1,148 @@
+import os
+import time
+import json
+import math
+
+from datetime import timedelta, date
+
+import pandas as pd
+import numpy as np
+import consul
+import requests
+import configparser
+import holidays
+
+from ebplatform_pyclient.client.user_client import UserClient
+from ebplatform_pyclient.transport.http_transport import HttpTransport
+from ebplatform_pyclient.utils.token_provider import RefreshableTokenProvider
+from fbprophet import Prophet
+
+time_string = time.strftime('%d_%m_%Y_')
+
+CREDENTIALS_PATH = 'my_platform/my_reports/confs/credentials'
+
+
+def get_parameters():
+    config_file = os.path.join(os.path.dirname('__file__'), 'config.ini')
+    config_parser = configparser.ConfigParser()
+    config_parser.read(config_file)
+    overfitting = float(config_parser['predictionsystem']['overfitting'])
+    days_worth_of_data = int(config_parser['predictionsystem']['days_worth_of_data'])
+    api_call_days = int(config_parser['predictionsystem']['api_call_days'])
+    clients = [client.strip() for client in config_parser['predictionsystem']['clients'].split(',')]
+    holiday = [day.strip() for day in config_parser['predictionsystem']['holiday'].split(',')]
+    countries = [country.strip() for country in config_parser['predictionsystem']['countries'].split(',')]
+    days_to_predict = int(config_parser['predictionsystem']['days_to_predict'])
+    return overfitting, days_worth_of_data, api_call_days, clients, holiday, days_to_predict, countries
+
+
+def get_years(days_worth_of_data):
+    years_worth_of_data = math.ceil(days_worth_of_data / 365)
+    years = range(date.today().year - years_worth_of_data, date.today().year + 2)
+    return years
+
+
+def generate_dist_report_from_api(stats_endpoint, bearer_token, start_date, end_date):
+    endpoint = '{stats_endpoint}'.format(
+        stats_endpoint=stats_endpoint)
+    headers = {
+        'Authorization': 'Bearer {token}'.format(token=bearer_token)
+    }
+    params = {
+        'start_date': start_date,
+        'end_date': end_date
+    }
+    response = requests.get(endpoint, params=params, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+
+
+def get_client_data(clients, bearer_token, days_worth_of_data, api_call_days):
+    client_data = {}
+    for client in clients:
+        client_data[client] = []
+        start = date.today() - timedelta(days=days_worth_of_data)
+        for fecha in pd.date_range(start, date.today() - timedelta(days=api_call_days),
+                                   freq='{0}D'.format(api_call_days)):
+            start = fecha
+            end = fecha + timedelta(days=api_call_days)
+            data = generate_dist_report_from_api(
+                "https://api.my_stats_place.com/stats/version/analysis/" + client + "/Client_reports",
+                bearer_token, start.isoformat(), end.isoformat())
+            client_data[client] += data['data']['queries_data']
+    return client_data
+
+
+def get_prophet_holidays():
+    holiday_info = []
+    holiday_dictionary = {}
+    for country in countries:
+        for year in years:
+            for date, holiday_name in holidays.US(years=year).items():
+                if holiday_name in holiday:
+                    holiday_info += [{'holiday': holiday_name, 'ds': str(date)}]
+                if holiday_name == 'Thanksgiving':
+                    holiday_info += [{'holiday': 'Black Friday', 'ds': str(date + timedelta(days=1))}]
+                    holiday_info += [{'holiday': 'Cyber Monday', 'ds': str(date + timedelta(days=4))}]
+        holiday_dictionary[country] = holiday_info
+    return holiday_dictionary
+
+
+def predict_client_data(client_data, clients, overfitting):
+    log_df_for_prediction = pd.DataFrame()
+    predicted = {}
+    holidays = pd.DataFrame(get_prophet_holidays()[countries[0]])
+    holidays['lower_window'] = 0
+    holidays['upper_window'] = 1
+    holidays['lower_window'].loc[holidays['holiday'] == 'Black Friday'] = -1
+    holidays['upper_window'].loc[holidays['holiday'] == 'Black Friday'] = 2
+
+    for client in clients:
+        prophet = Prophet(yearly_seasonality=True, changepoint_prior_scale=overfitting, holidays=holidays)
+        client_data_df = pd.DataFrame(client_data[client])
+        log_df_for_prediction['ds'] = client_data_df['datetime']
+        log_df_for_prediction['y'] = np.log(client_data_df['value'] + 0.1)
+        prophet.fit(log_df_for_prediction)
+        base_prediction_dataframe = prophet.make_future_dataframe(periods=days_to_predict)
+        forecast = prophet.predict(base_prediction_dataframe)
+        prediction = np.exp(forecast[['yhat_lower', 'yhat', 'yhat_upper', 'yearly', 'weekly']])
+        prediction['date'] = forecast['ds']
+        prediction.rename(columns = {'yhat_lower' : 'lower', 'yhat' : 'expected', 'yhat_upper' : 'upper'}, inplace=True)
+        predicted[client] = prediction
+    return predicted
+
+
+def all_data_to_json(client_data, predicted):
+    data = {}
+    for client in clients:
+        predicted[client]['date'] = predicted[client]['date'].astype(str)
+        client_data_reformat = pd.DataFrame(client_data[client])[['datetime', 'value']]
+        client_data_reformat.rename(columns = {'datetime': 'date', 'value': 'queries'}, inplace=True)
+        client_data_reformat['date'] = pd.to_datetime(client_data_reformat['date']).astype(str)
+
+        data[client] = {
+            'data': client_data_reformat.to_dict(orient='records'),
+            'prediction': predicted[client].to_dict(orient='records')
+        }
+    with open("data_and_predictions.json", "w") as file:
+        file.write(json.dumps(data))
+
+
+if __name__ == '__main__':
+    c = consul.Consul('pro-consul.internal.my_place.com')
+
+    transport = HttpTransport('https://api.my_stats_place.com/user/version')
+    user_client = UserClient(transport)
+
+    credentials = json.loads(c.kv.get(CREDENTIALS_PATH)[1]['Value'].decode())
+    token_provider = RefreshableTokenProvider(credentials['email'], credentials['password'], user_client)
+
+    overfitting, days_worth_of_data, api_call_days, clients, holiday, days_to_predict, countries = get_parameters()
+
+    years = get_years(days_worth_of_data)
+
+    client_data = get_client_data(clients, token_provider.token, days_worth_of_data, api_call_days)
+
+    predicted = predict_client_data(client_data, clients, overfitting)
+
+    all_data_to_json(client_data, predicted)
